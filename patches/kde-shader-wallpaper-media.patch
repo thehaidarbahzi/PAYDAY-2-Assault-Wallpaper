@@ -1,0 +1,393 @@
+diff --git a/package/contents/ui/ShaderSystem.qml b/package/contents/ui/ShaderSystem.qml
+index c309b41..2393ba6 100644
+--- a/package/contents/ui/ShaderSystem.qml
++++ b/package/contents/ui/ShaderSystem.qml
+@@ -7,6 +7,7 @@
+ import QtQuick
+ import QtQuick.Controls
+ import org.kde.plasma.plasmoid
++import org.kde.plasma.private.mpris as Mpris
+ import "shaderwallpaper"
+ 
+ Item {
+@@ -32,7 +33,40 @@ Item {
+     readonly property bool _allowExperimentalParallax: !restrictedMode && (wallpaperConfig ? (wallpaperConfig.experimentalParallax || false) : false)
+     readonly property bool _allowExperimentalScreens:  !restrictedMode && (wallpaperConfig ? (wallpaperConfig.experimentalScreenUniforms || false) : false)
+     readonly property bool _allowWatchSource: !restrictedMode && (wallpaperConfig ? (wallpaperConfig.watchSourceFile || false) : false)
++    readonly property bool _paydayAssaultShader: wallpaperConfig && wallpaperConfig.selectedShaderPath
++                                                    ? wallpaperConfig.selectedShaderPath.indexOf("Payday2_Assault") >= 0
++                                                    : false
++
++    // Follow the active MPRIS player (the same metadata source used by KDE's
++    // media controls) and hand its playing title to the shader engine.
++    Mpris.Mpris2Model { id: mprisModel }
++
++    readonly property string mediaArtworkUrl: {
++        const player = mprisModel.currentPlayer
++        return _paydayAssaultShader && player
++                && player.playbackStatus === Mpris.PlaybackStatus.Playing
++                ? player.artUrl : ""
++    }
++
++    function syncMediaTitle() {
++        const player = mprisModel.currentPlayer
++        const playing = player && player.playbackStatus === Mpris.PlaybackStatus.Playing
++        shaderEngine.mediaPlaying = playing
++        shaderEngine.mediaTitle = playing ? player.track : ""
++    }
+ 
++    Connections {
++        target: mprisModel
++        function onCurrentPlayerChanged() { syncMediaTitle() }
++    }
++    Connections {
++        target: mprisModel.currentPlayer
++        enabled: mprisModel.currentPlayer !== null
++        ignoreUnknownSignals: true
++        function onTrackChanged() { syncMediaTitle() }
++        function onPlaybackStatusChanged() { syncMediaTitle() }
++        function onArtUrlChanged() { syncMediaTitle() }
++    }
+     // Window model for pause detection
+     WindowModel {
+         id: windowModel
+@@ -49,13 +83,13 @@ Item {
+         id: cursorTracker
+         enabled: shaderSystem._allowMouse && shaderEngine.running
+         sensitivity: (wallpaperConfig && wallpaperConfig.mouseBias) || 1.0
+-        screen: shaderSystem.Window.window ? shaderSystem.Window.window.screen : null
++        screen: shaderSystem.Window.window && shaderSystem.Window.window.screen
++                ? shaderSystem.Window.window.screen : null
+         // Same pixel space as fragCoord / iResolution (ShaderEngine FBO).
+         referenceWidth: shaderEngine.width
+         referenceHeight: shaderEngine.height
+-        devicePixelRatio: shaderSystem.Window.window
+-                            ? shaderSystem.Window.window.screen.devicePixelRatio
+-                            : 1.0
++        devicePixelRatio: shaderSystem.Window.window && shaderSystem.Window.window.screen
++                            ? shaderSystem.Window.window.screen.devicePixelRatio : 1.0
+ 
+         onIMouseChanged: {
+             shaderEngine.iMouse = iMouse
+@@ -189,6 +223,7 @@ Item {
+     // Main shader rendering engine
+     ShaderEngine {
+         id: shaderEngine
++        mediaFontPath: Qt.resolvedUrl("Resources/DINEngschrift.ttf")
+         x: -shaderSystem._parallaxStrength * shaderSystem.width
+            + shaderSystem._parallaxOffsetPx
+         y: 0
+@@ -260,15 +295,18 @@ Item {
+         // (avoids loading the package-relative default that doesn't ship).
+         iChannel0: (wallpaperConfig && wallpaperConfig.iChannel0Enabled && wallpaperConfig.iChannel0)
+             ? Qt.resolvedUrl(wallpaperConfig.iChannel0) : ""
+-        iChannel1: (wallpaperConfig && wallpaperConfig.iChannel1Enabled && wallpaperConfig.iChannel1)
+-            ? Qt.resolvedUrl(wallpaperConfig.iChannel1) : ""
++        iChannel1: shaderSystem.mediaArtworkUrl
++            ? Qt.resolvedUrl(shaderSystem.mediaArtworkUrl)
++            : ((wallpaperConfig && wallpaperConfig.iChannel1Enabled && wallpaperConfig.iChannel1)
++                ? Qt.resolvedUrl(wallpaperConfig.iChannel1) : "")
+         iChannel2: (wallpaperConfig && wallpaperConfig.iChannel2Enabled && wallpaperConfig.iChannel2)
+             ? Qt.resolvedUrl(wallpaperConfig.iChannel2) : ""
+         iChannel3: (wallpaperConfig && wallpaperConfig.iChannel3Enabled && wallpaperConfig.iChannel3)
+             ? Qt.resolvedUrl(wallpaperConfig.iChannel3) : ""
+ 
+         iChannel0Enabled: wallpaperConfig ? wallpaperConfig.iChannel0Enabled === true : false
+-        iChannel1Enabled: wallpaperConfig ? wallpaperConfig.iChannel1Enabled === true : false
++        iChannel1Enabled: shaderSystem.mediaArtworkUrl.length > 0
++            || (wallpaperConfig ? wallpaperConfig.iChannel1Enabled === true : false)
+         iChannel2Enabled: wallpaperConfig ? wallpaperConfig.iChannel2Enabled === true : false
+         iChannel3Enabled: wallpaperConfig ? wallpaperConfig.iChannel3Enabled === true : false
+ 
+@@ -289,7 +327,7 @@ Item {
+         // Per-pass channel mappings
+         imageChannels: wallpaperConfig ? [
+             wallpaperConfig.imageChannel0 ?? 0,
+-            wallpaperConfig.imageChannel1 ?? 1,
++            shaderSystem.mediaArtworkUrl.length > 0 ? 1 : (wallpaperConfig.imageChannel1 ?? 1),
+             wallpaperConfig.imageChannel2 ?? 2,
+             wallpaperConfig.imageChannel3 ?? 3
+         ] : [0, 1, 2, 3]
+@@ -516,6 +554,7 @@ Item {
+ 
+     Component.onCompleted: {
+         console.log("Shader Wallpaper v4.0 initialized")
++        Qt.callLater(syncMediaTitle)
+         if (!wallpaperConfig) {
+             console.warn("Shader Wallpaper: wallpaperConfig not wired yet")
+             return
+@@ -572,4 +611,3 @@ Item {
+         }
+     }
+ }
+-
+diff --git a/src/core/shaderengine.cpp b/src/core/shaderengine.cpp
+index 095a557..c2c86ef 100644
+--- a/src/core/shaderengine.cpp
++++ b/src/core/shaderengine.cpp
+@@ -15,6 +15,10 @@
+ #include <QOpenGLFunctions>
+ #include <QOpenGLExtraFunctions>
+ #include <QImage>
++#include <QFont>
++#include <QFontDatabase>
++#include <QFontMetricsF>
++#include <QPainter>
+ #include <QQuickItemGrabResult>
+ #include <cmath>
+ 
+@@ -289,6 +293,11 @@ void ShaderEngine::setShaderSource(const QUrl &source)
+     m_shaderSource = source;
+     m_loadShadersFromDisk = !m_shaderSource.isEmpty();
+ 
++    // Start the newly selected shader's intro animation from its first frame.
++    // Without this, shaders that use iTime for a reveal/marquee begin at an
++    // arbitrary phase inherited from the previously active wallpaper.
++    resetTime();
++
+     if (m_loadShadersFromDisk) {
+         loadShaderPackageFromDisk();
+     }
+@@ -681,6 +690,64 @@ void ShaderEngine::setAudioData(const QVariantList &data)
+     // update() here or PipeWire's feed bypasses targetFps.
+ }
+ 
++void ShaderEngine::setMediaFontPath(const QUrl &path)
++{
++    if (m_mediaFontPath == path) return;
++    if (m_mediaFontId >= 0) {
++        QFontDatabase::removeApplicationFont(m_mediaFontId);
++        m_mediaFontId = -1;
++    }
++    m_mediaFontPath = path;
++    const QString fontFile = path.isLocalFile() ? path.toLocalFile() : path.toString();
++    m_mediaFontId = QFontDatabase::addApplicationFont(fontFile);
++    const QStringList families = m_mediaFontId >= 0
++        ? QFontDatabase::applicationFontFamilies(m_mediaFontId) : QStringList();
++    m_mediaFontFamily = families.isEmpty() ? QStringLiteral("DINEngschrift") : families.first();
++    Q_EMIT mediaFontPathChanged();
++    if (!m_mediaTitle.isEmpty()) {
++        const QString currentTitle = m_mediaTitle;
++        m_mediaTitle.clear();
++        setMediaTitle(currentTitle);
++    }
++}
++
++void ShaderEngine::setMediaTitle(const QString &title)
++{
++    const QString normalized = title.simplified().toUpper();
++    if (m_mediaTitle == normalized) return;
++    m_mediaTitle = normalized;
++
++    if (m_mediaTitle.isEmpty()) {
++        m_mediaTitleImage = QImage();
++    } else {
++        QFont font(m_mediaFontFamily.isEmpty() ? QStringLiteral("DINEngschrift") : m_mediaFontFamily);
++        font.setPixelSize(200); // DIN cap height lands near the existing 148px raster glyph.
++        font.setHintingPreference(QFont::PreferNoHinting);
++        QFontMetricsF metrics(font);
++        const QString suffix = QStringLiteral("       ///       MUSIC PLAY IN PROGRESS       ///       ");
++        const QString tile = m_mediaTitle + suffix;
++        const int width = qMax(512, qCeil(metrics.horizontalAdvance(tile)) + 2);
++        m_mediaTitleImage = QImage(width, 256, QImage::Format_RGBA8888_Premultiplied);
++        m_mediaTitleImage.fill(Qt::transparent);
++        QPainter painter(&m_mediaTitleImage);
++        painter.setRenderHint(QPainter::TextAntialiasing, true);
++        painter.setFont(font);
++        painter.setPen(Qt::white);
++        const qreal baseline = (256.0 - metrics.height()) * 0.5 + metrics.ascent();
++        painter.drawText(QPointF(0.0, baseline), tile);
++    }
++    Q_EMIT mediaTitleChanged();
++    update();
++}
++
++void ShaderEngine::setMediaPlaying(bool playing)
++{
++    if (m_mediaPlaying == playing) return;
++    m_mediaPlaying = playing;
++    Q_EMIT mediaPlayingChanged();
++    update();
++}
++
+ void ShaderEngine::setWindowsEnabled(bool enabled)
+ {
+     if (m_windowsEnabled == enabled) return;
+@@ -1356,6 +1423,10 @@ void ShaderEngineRenderer::updateUniforms(QOpenGLShaderProgram *program, bool fo
+     
+     program->setUniformValue("iResolution", resolution);
+     program->setUniformValue("iTime", (float)m_iTime);
++    const bool hasMediaArtwork = !forBufferPass && m_mediaPlaying
++        && m_imageChannelMapping[1] == 1 && m_channelTextures[1] != nullptr;
++    program->setUniformValue("iHasArtwork", hasMediaArtwork);
++    program->setUniformValue("iMusicPlaying", m_mediaPlaying);
+     // Buffer passes are substepped (see render()): each of the N passes this
+     // frame advances 1/N of the frame's delta, so simulations step at a
+     // fixed rate regardless of render FPS.
+@@ -1379,7 +1450,11 @@ void ShaderEngineRenderer::updateUniforms(QOpenGLShaderProgram *program, bool fo
+ 
+     QVector3D channelRes[4];
+     for (int i = 0; i < 4; i++) {
+-        if (m_channelTextures[i]) {
++        if (i == 0 && !forBufferPass && m_mediaTitleTexture) {
++            channelRes[i] = QVector3D(m_mediaTitleTexture->width(),
++                                      m_mediaTitleTexture->height(),
++                                      float(m_mediaTitleTexture->width()) / m_mediaTitleTexture->height());
++        } else if (m_channelTextures[i]) {
+             channelRes[i] = QVector3D(m_channelTextures[i]->width(), 
+                                        m_channelTextures[i]->height(), 
+                                        (float)m_channelTextures[i]->width() / m_channelTextures[i]->height());
+@@ -1657,6 +1732,23 @@ void ShaderEngineRenderer::renderBuffer(int bufferIndex)
+     fbo->release();
+ }
+ 
++void ShaderEngineRenderer::updateMediaTitleTexture()
++{
++    if (!m_mediaTitleTextureDirty) return;
++    m_mediaTitleTextureDirty = false;
++    m_mediaTitleTexture.reset();
++    if (m_mediaTitleImage.isNull()) return;
++
++#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
++    m_mediaTitleTexture = std::make_unique<QOpenGLTexture>(m_mediaTitleImage.flipped(Qt::Vertical));
++#else
++    m_mediaTitleTexture = std::make_unique<QOpenGLTexture>(m_mediaTitleImage.mirrored(false, true));
++#endif
++    m_mediaTitleTexture->setWrapMode(QOpenGLTexture::Repeat);
++    m_mediaTitleTexture->setMinificationFilter(QOpenGLTexture::LinearMipMapLinear);
++    m_mediaTitleTexture->setMagnificationFilter(QOpenGLTexture::Linear);
++}
++
+ void ShaderEngineRenderer::renderMainPass()
+ {
+     auto *f = QOpenGLContext::currentContext()->extraFunctions();
+@@ -1687,6 +1779,7 @@ void ShaderEngineRenderer::renderMainPass()
+         return;
+     }
+     
++    updateMediaTitleTexture();
+     m_shaderProgram->bind();
+     updateUniforms(m_shaderProgram.get());
+     
+@@ -1700,6 +1793,13 @@ void ShaderEngineRenderer::renderMainPass()
+     for (int i = 0; i < 4; i++) {
+         bindChannelInput(i, m_imageChannelMapping[i], -1);  // -1 = no current buffer (image pass)
+     }
++
++    // While a track is playing, replace only the title-strip texture; the
++    // configured static banner texture remains the fallback when playback stops.
++    if (m_mediaTitleTexture) {
++        f->glActiveTexture(GL_TEXTURE0);
++        m_mediaTitleTexture->bind();
++    }
+     
+     // Update audio texture data if enabled. bind() binds on the currently
+     // active texture unit, so the audio channel's unit must be selected
+@@ -1900,6 +2000,13 @@ void ShaderEngineRenderer::synchronize(QQuickFramebufferObject *item)
+         ? float(engine->currentFps())
+         : float(engine->targetFps());
+     m_iFrame = engine->iFrame();
++    const QImage mediaImage = engine->mediaTitleImage();
++    m_mediaPlaying = engine->mediaPlaying();
++    if (mediaImage.cacheKey() != m_mediaTitleImageKey) {
++        m_mediaTitleImage = mediaImage;
++        m_mediaTitleImageKey = mediaImage.cacheKey();
++        m_mediaTitleTextureDirty = true;
++    }
+     // Snapshot mouse: previous render-frame position vs current.
+     // mouseBias scales pixel-space coords (Shadertoy iMouse convention).
+     const qreal mouseBias = engine->mouseBias() * engine->resolutionScale();
+diff --git a/src/core/shaderengine.h b/src/core/shaderengine.h
+index 02e5f02..d60fb43 100644
+--- a/src/core/shaderengine.h
++++ b/src/core/shaderengine.h
+@@ -11,6 +11,7 @@
+ #include <QOpenGLShaderProgram>
+ #include <QOpenGLFramebufferObject>
+ #include <QOpenGLTexture>
++#include <QImage>
+ #include <QElapsedTimer>
+ #include <QTimer>
+ #include <QUrl>
+@@ -113,6 +114,11 @@ class ShaderEngine : public QQuickFramebufferObject
+     Q_PROPERTY(bool audioEnabled READ audioEnabled WRITE setAudioEnabled NOTIFY audioEnabledChanged)
+     Q_PROPERTY(int audioChannel READ audioChannel WRITE setAudioChannel NOTIFY audioChannelChanged)
+     Q_PROPERTY(QVariantList audioData READ audioData WRITE setAudioData NOTIFY audioDataChanged)
++
++    // MPRIS track title; rendered into a seamless ticker texture on the render thread.
++    Q_PROPERTY(QString mediaTitle READ mediaTitle WRITE setMediaTitle NOTIFY mediaTitleChanged)
++    Q_PROPERTY(bool mediaPlaying READ mediaPlaying WRITE setMediaPlaying NOTIFY mediaPlayingChanged)
++    Q_PROPERTY(QUrl mediaFontPath READ mediaFontPath WRITE setMediaFontPath NOTIFY mediaFontPathChanged)
+     
+     // Multi-monitor uniforms (experimental). When set, the shader gets:
+     //   uniform vec2 iScreenOffset; // this screen's top-left in pixels
+@@ -214,6 +220,10 @@ public:
+     bool audioEnabled() const { return m_audioEnabled; }
+     int audioChannel() const { return m_audioChannel; }
+     QVariantList audioData() const { return m_audioData; }
++    QString mediaTitle() const { return m_mediaTitle; }
++    bool mediaPlaying() const { return m_mediaPlaying; }
++    QUrl mediaFontPath() const { return m_mediaFontPath; }
++    QImage mediaTitleImage() const { return m_mediaTitleImage; }
+     
+     bool watchSourceFile() const { return m_watchSourceFile; }
+     void setWatchSourceFile(bool enabled);
+@@ -293,6 +303,9 @@ public:
+     void setAudioEnabled(bool enabled);
+     void setAudioChannel(int channel);
+     void setAudioData(const QVariantList &data);
++    void setMediaTitle(const QString &title);
++    void setMediaPlaying(bool playing);
++    void setMediaFontPath(const QUrl &path);
+     
+     void setScreenOffset(const QVector2D &offset);
+     void setScreenIndex(int index);
+@@ -367,6 +380,9 @@ Q_SIGNALS:
+     void audioEnabledChanged();
+     void audioChannelChanged();
+     void audioDataChanged();
++    void mediaTitleChanged();
++    void mediaPlayingChanged();
++    void mediaFontPathChanged();
+     
+     void watchSourceFileChanged();
+     void sourceFileReloaded();  // fired when hot-reload triggered a reload
+@@ -480,6 +496,13 @@ private:
+     bool m_audioEnabled = false;
+     int m_audioChannel = 0;
+     QVariantList m_audioData;
++
++    QString m_mediaTitle;
++    bool m_mediaPlaying = false;
++    QUrl m_mediaFontPath;
++    QString m_mediaFontFamily;
++    int m_mediaFontId = -1;
++    QImage m_mediaTitleImage;
+     
+     // Experimental: multi-monitor screen uniforms
+     QVector2D m_screenOffset;
+@@ -541,6 +564,7 @@ private:
+     void ensureBufferFBOs(int bufferIndex);
+     void renderBuffer(int bufferIndex);
+     void renderMainPass();
++    void updateMediaTitleTexture();
+     QSize computeBufferSimSize() const;
+     void updateUniforms(QOpenGLShaderProgram *program, bool forBufferPass = false);
+     void loadTexture(int channel, const QUrl &url);
+@@ -582,6 +606,11 @@ private:
+     // whenever a channel was enabled but pointed at a missing file).
+     std::array<QUrl, 4> m_channelFailedUrls;
+     std::array<bool, 4> m_channelEnabled = {true, true, true, false};
++    std::unique_ptr<QOpenGLTexture> m_mediaTitleTexture;
++    QImage m_mediaTitleImage;
++    qint64 m_mediaTitleImageKey = 0;
++    bool m_mediaTitleTextureDirty = true;
++    bool m_mediaPlaying = false;
+     
+     // Per-pass channel mapping
+     std::array<int, 4> m_imageChannelMapping = {0, 1, 2, 3};  // Default: texture 0-3
+@@ -677,4 +706,3 @@ public:
+ };
+ 
+ #endif // SHADERENGINE_H
+-
